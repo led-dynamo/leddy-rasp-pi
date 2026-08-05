@@ -16,10 +16,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let device_id = env::var("LEDDY_DEVICE_ID").unwrap_or_else(|_| "pi-development".into());
-    let url = env::var("LEDDY_DEVICE_WS_URL").unwrap_or_else(|_| "ws://localhost:8080/v1/ws/devices".into());
+    let url = env::var("LEDDY_DEVICE_WS_URL")
+        .unwrap_or_else(|_| "ws://localhost:8080/v1/ws/devices".into());
     let width = env_u16("LEDDY_MATRIX_WIDTH", 100);
     let height = env_u16("LEDDY_MATRIX_HEIGHT", 10);
-    let config = DisplayConfig { width, height, brightness: 96, serpentine: true, origin: PixelOrigin::TopLeft };
+    let config = DisplayConfig {
+        width,
+        height,
+        brightness: 96,
+        serpentine: true,
+        origin: PixelOrigin::TopLeft,
+    };
     config.validate()?;
 
     loop {
@@ -31,7 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_session(url: &str, device_id: &str, config: DisplayConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_session(
+    url: &str,
+    device_id: &str,
+    config: DisplayConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (socket, _) = connect_async(url).await?;
     let (mut writer, mut reader) = socket.split();
     let hello = DeviceEvent::Hello {
@@ -44,10 +55,14 @@ async fn run_session(url: &str, device_id: &str, config: DisplayConfig) -> Resul
             supports_brightness: true,
         },
     };
-    writer.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
+    writer
+        .send(Message::Text(serde_json::to_string(&hello)?.into()))
+        .await?;
 
     while let Some(message) = reader.next().await {
-        let Message::Text(text) = message? else { continue };
+        let Message::Text(text) = message? else {
+            continue;
+        };
         let command: DeviceCommand = serde_json::from_str(&text)?;
         match command {
             DeviceCommand::Show(message) => preview_message(&config, &message).await,
@@ -55,7 +70,9 @@ async fn run_session(url: &str, device_id: &str, config: DisplayConfig) -> Resul
             DeviceCommand::Configure(next) => next.validate()?,
             DeviceCommand::Ping { nonce } => {
                 let pong = DeviceEvent::Pong { nonce };
-                writer.send(Message::Text(serde_json::to_string(&pong)?.into())).await?;
+                writer
+                    .send(Message::Text(serde_json::to_string(&pong)?.into()))
+                    .await?;
             }
         }
     }
@@ -75,12 +92,22 @@ async fn preview_message(config: &DisplayConfig, message: &leddy_interfaces::Mes
             message.direction,
         );
         render_text_5x7(&mut frame, &message.text, offset);
-        let lit = frame.row_major().iter().filter(|pixel| **pixel != 0).count();
-        println!("message={} offset={} lit_pixels={}", message.id, offset, lit);
+        let lit = frame
+            .row_major()
+            .iter()
+            .filter(|pixel| **pixel != 0)
+            .count();
+        println!(
+            "message={} offset={} lit_pixels={}",
+            message.id, offset, lit
+        );
         sleep(Duration::from_millis(50)).await;
     }
 }
 
 fn env_u16(name: &str, fallback: u16) -> u16 {
-    env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(fallback)
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
 }
