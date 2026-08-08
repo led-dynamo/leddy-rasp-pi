@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod frame_sink;
+
+use frame_sink::FrameSink;
 use futures_util::{SinkExt, StreamExt};
 use leddy_interfaces::{
     DeviceCapabilities, DeviceCommand, DeviceEvent, DevicePlatform, DeviceTelemetry,
     DeviceTransport, DisplayConfig, MessageEnvelope, PixelOrigin, RECOMMENDED_MAX_HEIGHT,
     RECOMMENDED_MAX_WIDTH, RECOMMENDED_MIN_HEIGHT, RECOMMENDED_MIN_WIDTH,
 };
-use leddy_lib::{FrameBuffer, render_message_frame};
+use leddy_lib::render_message_frame;
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -25,6 +28,7 @@ struct RuntimeSettings {
     ws_url: String,
     config_path: PathBuf,
     snapshot_path: Option<PathBuf>,
+    hub75_helper: Option<PathBuf>,
     frame_interval: Duration,
     telemetry_interval: Duration,
 }
@@ -39,6 +43,7 @@ impl RuntimeSettings {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/leddy/display-config.json")),
             snapshot_path: env::var_os("LEDDY_FRAME_SNAPSHOT").map(PathBuf::from),
+            hub75_helper: env::var_os("LEDDY_HUB75_HELPER").map(PathBuf::from),
             frame_interval: Duration::from_millis(env_u64("LEDDY_FRAME_INTERVAL_MS", 50).max(1)),
             telemetry_interval: Duration::from_secs(
                 env_u64("LEDDY_TELEMETRY_INTERVAL_SECS", 5).max(1),
@@ -53,50 +58,6 @@ struct ActiveMessage {
     started: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FrameStats {
-    pixels: usize,
-    lit_pixels: usize,
-}
-
-#[derive(Debug)]
-struct FrameSink {
-    snapshot_path: Option<PathBuf>,
-}
-
-impl FrameSink {
-    fn new(snapshot_path: Option<PathBuf>) -> Self {
-        Self { snapshot_path }
-    }
-
-    fn present(&self, config: &DisplayConfig, frame: &FrameBuffer) -> io::Result<FrameStats> {
-        let pixels = encode_device_frame(config, frame);
-        let stats = FrameStats {
-            pixels: pixels.len(),
-            lit_pixels: pixels.iter().filter(|pixel| **pixel != 0).count(),
-        };
-        self.write_snapshot(&pixels)?;
-        Ok(stats)
-    }
-
-    fn clear(&self, config: &DisplayConfig) -> io::Result<()> {
-        self.write_snapshot(&vec![0; config.pixel_count()])
-    }
-
-    fn write_snapshot(&self, pixels: &[u8]) -> io::Result<()> {
-        let Some(path) = &self.snapshot_path else {
-            return Ok(());
-        };
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, pixels)
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -107,7 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fallback = config_from_env()?;
     let mut config = load_config(&settings.config_path, fallback)?;
     validate_supported_config(&config)?;
-    let mut sink = FrameSink::new(settings.snapshot_path.clone());
+    let mut sink = FrameSink::new(
+        settings.snapshot_path.clone(),
+        settings.hub75_helper.clone(),
+    )?;
     let mut backoff = MIN_RECONNECT_BACKOFF;
 
     loop {
@@ -327,14 +291,6 @@ fn persist_config(path: &Path, config: &DisplayConfig) -> io::Result<()> {
     fs::rename(temporary, path)
 }
 
-fn encode_device_frame(config: &DisplayConfig, frame: &FrameBuffer) -> Vec<u8> {
-    frame
-        .device_order()
-        .into_iter()
-        .map(|pixel| if pixel == 0 { 0 } else { config.brightness })
-        .collect()
-}
-
 fn next_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_RECONNECT_BACKOFF)
 }
@@ -407,24 +363,6 @@ mod tests {
         config.width = 300;
         config.height = 21;
         assert!(validate_supported_config(&config).is_err());
-    }
-
-    #[test]
-    fn device_frame_applies_serpentine_order_and_brightness() {
-        let config = DisplayConfig {
-            width: 3,
-            height: 2,
-            brightness: 96,
-            serpentine: true,
-            origin: PixelOrigin::TopLeft,
-        };
-        let mut frame = FrameBuffer::new(&config);
-        frame.set(0, 0, 255);
-        frame.set(0, 1, 255);
-        assert_eq!(
-            encode_device_frame(&config, &frame),
-            vec![96, 0, 0, 0, 0, 96]
-        );
     }
 
     #[test]
