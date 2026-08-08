@@ -230,7 +230,10 @@ mod tests {
         assert_eq!(packet[11], 96);
         assert_eq!(u16::from_le_bytes([packet[12], packet[13]]), 3);
         assert_eq!(u16::from_le_bytes([packet[14], packet[15]]), 2);
-        assert_eq!(u32::from_le_bytes([packet[16], packet[17], packet[18], packet[19]]), 6);
+        assert_eq!(
+            u32::from_le_bytes([packet[16], packet[17], packet[18], packet[19]]),
+            6
+        );
         assert_eq!(&packet[20..], pixels.as_slice());
     }
 
