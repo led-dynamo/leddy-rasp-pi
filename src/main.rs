@@ -87,7 +87,10 @@ impl FrameSink {
         let Some(path) = &self.snapshot_path else {
             return Ok(());
         };
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, pixels)
@@ -244,10 +247,7 @@ async fn run_session(
     Ok(())
 }
 
-async fn send_event<S>(
-    writer: &mut S,
-    event: DeviceEvent,
-) -> Result<(), Box<dyn std::error::Error>>
+async fn send_event<S>(writer: &mut S, event: DeviceEvent) -> Result<(), Box<dyn std::error::Error>>
 where
     S: SinkExt<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -310,7 +310,10 @@ fn load_config(path: &Path, fallback: DisplayConfig) -> io::Result<DisplayConfig
 
 fn persist_config(path: &Path, config: &DisplayConfig) -> io::Result<()> {
     validate_supported_config(config)?;
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     let file_name = path
@@ -418,7 +421,10 @@ mod tests {
         let mut frame = FrameBuffer::new(&config);
         frame.set(0, 0, 255);
         frame.set(0, 1, 255);
-        assert_eq!(encode_device_frame(&config, &frame), vec![96, 0, 0, 0, 0, 96]);
+        assert_eq!(
+            encode_device_frame(&config, &frame),
+            vec![96, 0, 0, 0, 0, 96]
+        );
     }
 
     #[test]
@@ -437,7 +443,10 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_is_bounded() {
-        assert_eq!(next_backoff(Duration::from_millis(250)), Duration::from_millis(500));
+        assert_eq!(
+            next_backoff(Duration::from_millis(250)),
+            Duration::from_millis(500)
+        );
         assert_eq!(next_backoff(Duration::from_secs(20)), MAX_RECONNECT_BACKOFF);
         assert_eq!(next_backoff(MAX_RECONNECT_BACKOFF), MAX_RECONNECT_BACKOFF);
     }
