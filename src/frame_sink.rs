@@ -200,6 +200,7 @@ mod tests {
             brightness: 96,
             serpentine: true,
             origin: PixelOrigin::TopLeft,
+            safety_limits: None,
         }
     }
 
