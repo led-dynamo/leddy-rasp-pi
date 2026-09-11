@@ -6,14 +6,15 @@ use frame_sink::FrameSink;
 use futures_util::{SinkExt, StreamExt};
 use leddy_interfaces::{
     DeviceCapabilities, DeviceCommand, DeviceEvent, DevicePlatform, DeviceTelemetry,
-    DeviceTransport, DisplayConfig, MessageEnvelope, PixelOrigin, RECOMMENDED_MAX_HEIGHT,
-    RECOMMENDED_MAX_WIDTH, RECOMMENDED_MIN_HEIGHT, RECOMMENDED_MIN_WIDTH,
+    DeviceTransport, DisplayConfig, FirmwareUpdateCapabilities, MessageEnvelope, PixelOrigin,
+    RECOMMENDED_MAX_HEIGHT, RECOMMENDED_MAX_WIDTH, RECOMMENDED_MIN_HEIGHT, RECOMMENDED_MIN_WIDTH,
+    SafetyLimits, SafetySensorCapabilities,
 };
-use leddy_lib::render_message_frame;
+use leddy_lib::{SafetyController, SafetyObservation, render_message_frame};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -80,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => tracing::warn!("device socket closed"),
             Err(error) => tracing::error!(%error, "device session failed"),
         }
+        sink.clear(&config)?;
 
         backoff = if session_started.elapsed() >= HEALTHY_SESSION {
             MIN_RECONNECT_BACKOFF
@@ -108,6 +110,9 @@ async fn run_session(
             supports_brightness: true,
             platform: Some(DevicePlatform::RaspberryPi),
             transports: vec![DeviceTransport::Wifi, DeviceTransport::Ethernet],
+            safety_sensors: SafetySensorCapabilities::default(),
+            supports_latched_faults: true,
+            firmware_updates: FirmwareUpdateCapabilities::default(),
         },
     };
     send_event(&mut writer, hello).await?;
@@ -117,6 +122,8 @@ async fn run_session(
     frame_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut telemetry_tick = interval(settings.telemetry_interval);
     telemetry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut safety = SafetyController::new(safety_limits(config))?;
+    let mut last_authenticated_contact_unix_ms = now_unix_ms();
 
     loop {
         tokio::select! {
@@ -127,6 +134,7 @@ async fn run_session(
                 match incoming? {
                     Message::Text(text) => {
                         let command: DeviceCommand = serde_json::from_str(&text)?;
+                        last_authenticated_contact_unix_ms = now_unix_ms();
                         match command {
                             DeviceCommand::Show(message) => {
                                 message.validate()?;
@@ -146,6 +154,7 @@ async fn run_session(
                                 validate_supported_config(&next)?;
                                 persist_config(&settings.config_path, &next)?;
                                 *config = next;
+                                safety = SafetyController::new(safety_limits(config))?;
                                 if let Some(active) = active.as_mut() {
                                     active.started = Instant::now();
                                 }
@@ -158,9 +167,39 @@ async fn run_session(
                             DeviceCommand::Ping { nonce } => {
                                 send_event(&mut writer, DeviceEvent::Pong { nonce }).await?;
                             }
+                            DeviceCommand::ResetSafetyFault(authorization) => {
+                                let command_id = authorization.authorization_id.clone();
+                                match safety.reset_authorized(&authorization, now_unix_ms()) {
+                                    Ok(_) => {
+                                        send_event(
+                                            &mut writer,
+                                            DeviceEvent::Ack { command_id },
+                                        ).await?;
+                                    }
+                                    Err(error) => {
+                                        send_event(
+                                            &mut writer,
+                                            DeviceEvent::Error {
+                                                code: "safety_reset_rejected".into(),
+                                                message: error.to_string(),
+                                            },
+                                        ).await?;
+                                    }
+                                }
+                            }
+                            DeviceCommand::StageFirmware(_) | DeviceCommand::ActivateStagedFirmware { .. } => {
+                                send_event(
+                                    &mut writer,
+                                    DeviceEvent::Error {
+                                        code: "firmware_update_not_configured".into(),
+                                        message: "this controller has no provisioned firmware update keyring".into(),
+                                    },
+                                ).await?;
+                            }
                         }
                     }
                     Message::Ping(payload) => {
+                        last_authenticated_contact_unix_ms = now_unix_ms();
                         writer.send(Message::Pong(payload)).await?;
                     }
                     Message::Close(_) => break,
@@ -168,6 +207,17 @@ async fn run_session(
                 }
             }
             _ = frame_tick.tick() => {
+                let decision = safety.observe(SafetyObservation {
+                    observed_at_unix_ms: now_unix_ms(),
+                    last_authenticated_command_unix_ms: last_authenticated_contact_unix_ms,
+                    supply_millivolts: None,
+                    current_milliamps: None,
+                    temperature_millicelsius: None,
+                });
+                if decision.fault_latched {
+                    sink.clear(config)?;
+                    continue;
+                }
                 let rendered = if let Some(active) = active.as_ref() {
                     let elapsed_ms = active.started.elapsed().as_millis() as u64;
                     Some(render_message_frame(config, &active.message, elapsed_ms)?)
@@ -193,6 +243,7 @@ async fn run_session(
                 }
             }
             _ = telemetry_tick.tick() => {
+                let decision = safety.decision();
                 send_event(
                     &mut writer,
                     DeviceEvent::Telemetry(DeviceTelemetry {
@@ -200,6 +251,14 @@ async fn run_session(
                         uptime_seconds: 0,
                         free_memory_bytes: 0,
                         temperature_celsius: None,
+                        supply_millivolts: None,
+                        current_milliamps: None,
+                        power_milliwatts: None,
+                        brightness_limit: Some(decision.brightness_limit.min(config.brightness)),
+                        fault_latched: decision.fault_latched,
+                        active_faults: decision.active_faults,
+                        recent_faults: safety.recent_faults().to_vec(),
+                        firmware: None,
                         wifi_rssi_dbm: None,
                         current_message_id: active.as_ref().map(|active| active.message.id.clone()),
                     }),
@@ -229,9 +288,35 @@ fn config_from_env() -> io::Result<DisplayConfig> {
         brightness: env_u8("LEDDY_BRIGHTNESS", 96),
         serpentine: env_bool("LEDDY_SERPENTINE", true),
         origin: env_origin("LEDDY_PIXEL_ORIGIN", PixelOrigin::TopLeft)?,
+        safety_limits: Some(default_safety_limits()),
     };
     validate_supported_config(&config)?;
     Ok(config)
+}
+
+fn default_safety_limits() -> SafetyLimits {
+    SafetyLimits {
+        minimum_supply_millivolts: None,
+        maximum_current_milliamps: None,
+        maximum_temperature_millicelsius: None,
+        fail_safe_brightness: 0,
+        communication_timeout_ms: 10_000,
+        telemetry_interval_ms: 1_000,
+        fault_history_capacity: 16,
+    }
+}
+
+fn safety_limits(config: &DisplayConfig) -> SafetyLimits {
+    config.safety_limits.unwrap_or_else(default_safety_limits)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn validate_supported_config(config: &DisplayConfig) -> io::Result<()> {
@@ -351,6 +436,7 @@ mod tests {
             brightness: 80,
             serpentine: true,
             origin: PixelOrigin::TopLeft,
+            safety_limits: Some(default_safety_limits()),
         }
     }
 
